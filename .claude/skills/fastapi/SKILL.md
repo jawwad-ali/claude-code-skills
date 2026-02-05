@@ -1,7 +1,6 @@
 ---
-name: FastAPI Development
+name: fastapi
 description: This skill should be used when the user asks to "create a FastAPI app", "add an API endpoint", "create a REST API", "implement authentication", "add OAuth2", "create Pydantic models", "add request validation", "implement dependency injection", "create API routers", "add middleware", "handle errors in FastAPI", "create background tasks", "add WebSocket endpoints", "implement CRUD operations", or mentions FastAPI, Pydantic, async Python APIs, or Starlette.
-version: 1.0.0
 ---
 
 # FastAPI Development Guide
