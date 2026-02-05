@@ -1,6 +1,6 @@
 ---
 name: nextjs-app-router
-description: This skill should be used when the user asks to "create a Next.js page", "add a route", "create a layout", "implement server components", "add client components", "create API routes", "implement server actions", "add loading states", "handle errors in Next.js", "create dynamic routes", "implement parallel routes", "add intercepting routes", or mentions Next.js App Router, React Server Components (RSC), or app directory patterns.
+description: Build Next.js applications with App Router - routing, server/client components, data fetching, server actions, layouts, loading states, and error handling.
 ---
 
 # Next.js App Router Development Guide
