@@ -1,0 +1,52 @@
+# Namespace + ConfigMap + Secret — Project Bootstrap
+# Apply first: kubectl apply -f k8s/namespace-config.yml
+#
+# This creates the namespace and config resources that all other manifests
+# depend on. Replace <my-project> and config values for your project.
+#
+# Create real secrets at deploy time (never commit real values):
+#   kubectl -n <my-project> create secret generic app-secrets \
+#     --from-literal=DATABASE_PASSWORD=secure-pw \
+#     --from-literal=API_KEY=sk-... \
+#     --dry-run=client -o yaml | kubectl apply -f -
+
+---
+# Namespace — isolates all project resources
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: my-project
+  labels:
+    app: my-project
+
+---
+# ConfigMap — non-sensitive configuration
+# All keys become env vars when mounted with envFrom.configMapRef
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+  namespace: my-project
+  labels:
+    app: my-project
+data:
+  # Add your non-sensitive config keys here
+  LOG_LEVEL: "info"
+  DATABASE_HOST: "postgres"          # Internal DNS: service name
+  CACHE_URL: "redis://redis:6379"    # Internal DNS: service-name:port
+
+---
+# Secret — sensitive credentials (base64-encoded placeholders)
+# NEVER commit real values to source control.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: app-secrets
+  namespace: my-project
+  labels:
+    app: my-project
+type: Opaque
+data:
+  # echo -n 'your-value' | base64
+  DATABASE_PASSWORD: ""
+  API_KEY: ""

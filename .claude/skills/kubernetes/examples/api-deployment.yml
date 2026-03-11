@@ -1,0 +1,173 @@
+# API Deployment — Init Container + Probes + HPA + Service
+# Generic pattern for a stateless backend with database migrations
+#
+# Key decisions:
+# - Init container runs migrations before app starts (must be idempotent)
+# - Liveness: /healthz (process only — no dependency checks to avoid cascades)
+# - Readiness: /ready (checks dependencies — removes from traffic on failure)
+# - envFrom: bulk inject config from ConfigMap + Secret
+# - Variable substitution: compose DATABASE_URL from secret values
+# - HPA: CPU-based scaling with stabilization windows to prevent flapping
+#
+# Adapt: change image, ports, probe paths, resource limits, HPA bounds
+
+---
+# Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-api
+  namespace: my-project
+  labels:
+    app: my-api
+    component: backend
+    part-of: my-project
+spec:
+  replicas: 1                            # HPA overrides this at runtime
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      app: my-api
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1                        # One extra pod during rollout
+      maxUnavailable: 0                  # Zero-downtime deploy
+  template:
+    metadata:
+      labels:
+        app: my-api
+        component: backend
+        part-of: my-project
+    spec:
+      # --- Init container: run setup tasks before app starts ---
+      initContainers:
+        - name: run-migrations
+          image: my-api:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - bash
+            - -c
+            - |
+              cd /app
+              bash scripts/migrate.sh    # Your migration script
+          envFrom:
+            - configMapRef:
+                name: app-config
+            - secretRef:
+                name: app-secrets
+          env:
+            - name: DATABASE_URL
+              value: "postgresql://postgres:$(DATABASE_PASSWORD)@postgres:5432/mydb"
+
+      # --- Main container ---
+      containers:
+        - name: my-api
+          image: my-api:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+
+          # Liveness: is the process alive? No dependency checks.
+          # Failure → restart pod (detects deadlocks, hung processes)
+          livenessProbe:
+            httpGet:
+              path: /healthz             # Lightweight — returns 200 if alive
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+          # Readiness: can it serve traffic? Checks dependencies.
+          # Failure → remove from Service (stop routing, don't restart)
+          readinessProbe:
+            httpGet:
+              path: /ready               # Checks DB + cache connectivity
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 2
+
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+
+          envFrom:
+            - configMapRef:
+                name: app-config
+            - secretRef:
+                name: app-secrets
+
+          # Composite env vars using variable substitution
+          env:
+            - name: DATABASE_URL
+              value: "postgresql://postgres:$(DATABASE_PASSWORD)@postgres:5432/mydb"
+
+      restartPolicy: Always
+
+---
+# Service — stable internal DNS: my-api:8000
+apiVersion: v1
+kind: Service
+metadata:
+  name: my-api
+  namespace: my-project
+  labels:
+    app: my-api
+    component: backend
+    part-of: my-project
+spec:
+  type: ClusterIP
+  selector:
+    app: my-api
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+      protocol: TCP
+
+---
+# HorizontalPodAutoscaler — auto-scale based on CPU
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: my-api-hpa
+  namespace: my-project
+  labels:
+    app: my-api
+    part-of: my-project
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: my-api
+  minReplicas: 1
+  maxReplicas: 10                      # Adjust ceiling for your cluster
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 300  # 5 minutes cooldown
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 60

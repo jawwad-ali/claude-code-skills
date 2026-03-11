@@ -1,0 +1,113 @@
+# Redis Cache — PVC + Deployment + Service
+# Generic pattern for a single-replica cache with optional persistence
+#
+# Key decisions:
+# - AOF with everysec fsync: balances durability and performance
+# - PVC for /data: AOF file survives pod restarts
+# - strategy: Recreate: prevents two Redis instances on same PVC
+# - redis-cli ping: native health check (no curl/wget needed)
+#
+# Adapt: remove AOF + PVC if you only need ephemeral cache, adjust storage size
+
+---
+# PersistentVolumeClaim — AOF file survives pod restarts
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: cache-pvc
+  namespace: my-project
+  labels:
+    app: redis
+    component: cache
+    part-of: my-project
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 512Mi                 # Adjust based on cache size
+
+---
+# Deployment — Redis with AOF persistence
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: my-project
+  labels:
+    app: redis
+    component: cache
+    part-of: my-project
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+        component: cache
+        part-of: my-project
+    spec:
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          command:                      # Enable AOF persistence
+            - redis-server
+            - "--appendonly"
+            - "yes"
+            - "--appendfsync"
+            - "everysec"               # Fsync every second (1s max data loss)
+          ports:
+            - name: redis
+              containerPort: 6379
+          volumeMounts:
+            - name: cache-storage
+              mountPath: /data         # Redis default data directory
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+          livenessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            failureThreshold: 3
+      volumes:
+        - name: cache-storage
+          persistentVolumeClaim:
+            claimName: cache-pvc
+
+---
+# Service — stable internal DNS: redis:6379
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: my-project
+  labels:
+    app: redis
+    component: cache
+    part-of: my-project
+spec:
+  type: ClusterIP
+  selector:
+    app: redis
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: 6379
+      protocol: TCP
