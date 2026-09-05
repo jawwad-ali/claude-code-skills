@@ -1,0 +1,411 @@
+# Spring Boot 4.1.0 configuration for a money service in a container.
+#
+# Every non-obvious key has a WHY. Several are Boot 4 renames whose Boot <=3.5 spellings are
+# SILENTLY IGNORED — Boot does not error on unknown properties, so a copied 3.x block leaves you
+# leaking stack traces and running with an infinite outbound read timeout, with no warning anywhere.
+#
+# Layout: this file holds shared defaults. Environment-specific overrides live in
+# application-local.yaml / application-prod.yaml (both sketched at the bottom).
+#
+# THERE ARE NO SECRETS IN THIS FILE, AND THERE MUST NEVER BE. application.yaml is packaged inside
+# the jar, inside the image, pushed to a registry, and readable by anyone who can `docker pull`. It
+# is a distribution artifact, not a vault.
+
+spring:
+  application:
+    name: ledger-api
+
+  # ===================================================================================
+  # Datasource
+  # ===================================================================================
+  datasource:
+    # WHY relaxed binding instead of a placeholder: SPRING_DATASOURCE_URL,
+    # SPRING_DATASOURCE_USERNAME and SPRING_DATASOURCE_PASSWORD bind to these properties from the
+    # environment with NO YAML key at all. Note there is deliberately no `username:` or
+    # `password:` key below.
+    #
+    # This is strictly stronger than `${DB_PASSWORD}`: there is nothing to accidentally commit,
+    # nothing baked into an image layer, and nothing for a future "let's add a default for local
+    # dev" commit to turn into a production credential. `password: ${DB_PASSWORD:changeit}` is
+    # exactly how production credentials get committed — the default IS the password one day.
+    url: ${SPRING_DATASOURCE_URL}
+
+    # WHY lazy (NEW in Spring Boot 4.1 ONLY): the auto-configured pooled DataSource is wrapped in
+    # LazyConnectionDataSourceProxy, so a physical connection is taken only when a JDBC statement
+    # actually runs. Without it, the transaction manager grabs a connection the moment the
+    # transaction starts — including for @Transactional(readOnly = true) methods that spend most of
+    # their time in a serializer or an HTTP call.
+    #
+    # It defers the FIRST acquisition; it does not release early. On Boot 3.x this property does not
+    # exist and you must wrap the DataSource by hand — so if you migrate such code AND set this,
+    # you double-wrap.
+    connection-fetch: lazy
+
+    hikari:
+      pool-name: ledger-pool
+
+      # ---------------------------------------------------------------------------
+      # THE POOL IS PER REPLICA. Do this arithmetic explicitly, before deploying.
+      # ---------------------------------------------------------------------------
+      #   psql> show max_connections;        -- ASK the server. Do not assume 100.
+      #   max_connections                              = 200
+      #   reserved (superuser, monitoring, migrations)  =  20
+      #   maxReplicas x maximum-pool-size = 15 x 10    = 150  <=  180   OK
+      #
+      # Get this wrong and an autoscaling event makes EVERY replica fail simultaneously with
+      # SQLSTATE 53300 too_many_connections, fail readiness, restart, and repeat. If your
+      # autoscaler can reach 25 replicas, this must come down to 7 — or you need PgBouncer in
+      # transaction mode in front of PostgreSQL.
+      #
+      # WHY 10 and not 50: HikariCP's own sizing guidance is the PostgreSQL formula
+      # (core_count * 2) + effective_spindle_count, plus the axiom "You want a small pool,
+      # saturated with threads waiting for connections". Their worked example: a 4-core box wants
+      # 9 connections and serves thousands of users. More is not faster — executing A then B is
+      # always faster than time-slicing A and B.
+      maximum-pool-size: 10
+
+      # == maximum-pool-size: a fixed-size pool, so no idle churn and no connect latency on a
+      # traffic burst.
+      minimum-idle: 10
+
+      # ms. Fail FAST into a 503 rather than queueing behind a stuck pool. This matters far more
+      # once virtual threads are enabled, because the pool then becomes your only concurrency
+      # limit and unbounded virtual threads would otherwise park here forever.
+      connection-timeout: 3000
+
+      validation-timeout: 2000   # must be < connection-timeout
+      max-lifetime: 900000       # keep several seconds under any DB/proxy idle cutoff
+      keepalive-time: 120000
+
+      # ms. 0 = off. Turn this on in staging: a leaked connection is otherwise invisible until the
+      # pool is exhausted.
+      leak-detection-threshold: 20000
+
+      # Fail fast at startup rather than booting half-broken and failing the first request.
+      initialization-fail-timeout: 1
+
+  # ===================================================================================
+  # Transactions
+  # ===================================================================================
+  transaction:
+    # A global floor so no transaction can hang forever holding a row lock and a pooled
+    # connection. Per-method @Transactional(timeout = n) overrides it.
+    default-timeout: 15s
+    rollback-on-commit-failure: true
+
+  # ===================================================================================
+  # JDBC template defaults
+  # ===================================================================================
+  jdbc:
+    template:
+      query-timeout: 10s
+      fetch-size: 500
+
+  # ===================================================================================
+  # Flyway
+  # ===================================================================================
+  # Requires BOTH spring-boot-starter-flyway (NEW in Boot 4) AND
+  # org.flywaydb:flyway-database-postgresql. With only flyway-core you get a startup failure about
+  # an unsupported database that never mentions the missing module.
+  flyway:
+    enabled: true
+    locations: "classpath:db/migration"
+
+    # true ONLY to adopt an existing, already-populated schema.
+    baseline-on-migrate: false
+
+    # Keep false in CI and prod. Enabling it lets two branches that both minted V5 apply in an
+    # undefined order.
+    out-of-order: false
+
+    validate-on-migrate: true
+
+    # OPT IN — Boot's default is FALSE, which means a mis-named migration is SILENTLY not picked
+    # up. Catches V2_add.sql (single underscore is not the separator), v2__add.sql (the prefix is
+    # case-sensitive) and V2__add.SQL (so is the suffix).
+    validate-migration-naming: true
+
+    clean-disabled: true          # default; keep it. One bad profile away from dropping prod.
+    fail-on-missing-locations: true   # catch a mis-packaged jar at boot, not at first query
+
+    # NOTE: a migration containing CREATE INDEX CONCURRENTLY cannot run in a transaction (SQLSTATE
+    # 25001), but execute-in-transaction defaults to TRUE. Give such DDL its own migration with
+    # spring.flyway.execute-in-transaction=false, or it fails on first deploy.
+
+  # ===================================================================================
+  # Web / errors
+  # ===================================================================================
+  mvc:
+    problemdetails:
+      # Defaults to FALSE. Only needed if you do NOT declare an advice extending
+      # ResponseEntityExceptionHandler. Without either, your own handlers return problem+json
+      # while every FRAMEWORK-raised error returns Boot's legacy {timestamp,status,error,path}
+      # shape — two incompatible error contracts in one API.
+      enabled: true
+
+  web:
+    error:
+      # Boot 4 namespace. The Boot <=3.5 spelling was `server.error.*`, which on 4.x is SILENTLY
+      # IGNORED — so a copied 3.x block leaves include-stacktrace at its default and leaks SQL
+      # fragments, table names and account identifiers from a money service.
+      include-stacktrace: never
+      include-message: never
+      include-binding-errors: never
+
+  # ===================================================================================
+  # Outbound HTTP
+  # ===================================================================================
+  http:
+    # PLURAL "clients" — Boot 4.x. Boot 3.4/3.5 used the singular `spring.http.client.*`, which on
+    # 4.x is silently ignored, leaving you with the JDK HttpClient's default read timeout: INFINITE.
+    #
+    # An outbound call with no read timeout inside a @Transactional method holding
+    # SELECT ... FOR UPDATE locks is a self-inflicted outage: locks held for the life of the hung
+    # request, pool exhausts, readiness fails, the orchestrator restarts the container
+    # mid-transaction.
+    clients:
+      connect-timeout: 2s
+      read-timeout: 5s
+      redirects: dont-follow
+
+  # ===================================================================================
+  # Lifecycle / shutdown
+  # ===================================================================================
+  lifecycle:
+    # PER PHASE, not total — the property javadoc reads "Timeout for the shutdown of any phase
+    # (group of SmartLifecycle beans with the same phase value)". With three phases at 8s the worst
+    # case is 24s, which must stay STRICTLY BELOW the platform's grace period.
+    #
+    # Kubernetes and Azure Container Apps both default terminationGracePeriodSeconds to 30s. If
+    # Spring's window >= the platform's, the platform SIGKILLs you mid-drain and graceful shutdown
+    # is theatre: you get all the complexity and none of the benefit.
+    #
+    # Budget: platform grace >= drain delay + Spring shutdown + slack. See the prod block below.
+    timeout-per-shutdown-phase: 8s
+
+  # Virtual threads are DAEMON threads, so a JVM whose only remaining work is @Scheduled can exit.
+  # Harmless to set; essential if you ever enable spring.threads.virtual.enabled.
+  main:
+    keep-alive: true
+
+server:
+  port: 8080
+
+  # Already the DEFAULT in Boot 4 — verbatim from the 4.1.0 docs: "Graceful shutdown is enabled by
+  # default with all three embedded web servers (Jetty, Reactor Netty, and Tomcat)". Stated here so
+  # nobody "optimises" it away, and because `server.shutdown: immediate` is what disables it.
+  # (Half the blog posts telling you to set this are describing a no-op on 4.x.)
+  shutdown: graceful
+
+  # REQUIRED if the platform enforces a read-only root filesystem. Embedded Tomcat creates a work
+  # directory under /tmp at startup and fails with `WebServerException: Unable to create tempDir`.
+  # You need this AND a writable tmpfs mounted at /tmp. This only breaks once the platform enforces
+  # readOnlyRootFilesystem — i.e. never on your laptop, always in the hardened environment.
+  tomcat:
+    basedir: /tmp/tomcat
+    # Connection-layer admission control. Under virtual threads `threads.max` becomes INERT, so
+    # these two are what is left to bound in-flight work.
+    max-connections: 2000
+    accept-count: 100
+
+# =====================================================================================
+# Actuator: probes, and nothing more than you need
+# =====================================================================================
+management:
+  endpoints:
+    web:
+      base-path: /actuator
+      exposure:
+        # The default is [health] ONLY, so /actuator/prometheus 404s until listed — a 404 that
+        # usually gets blamed on the scrape config.
+        #
+        # NEVER use "*": that also publishes /actuator/env, /actuator/configprops,
+        # /actuator/heapdump and /actuator/threaddump.
+        include: "health,info,prometheus"
+
+  endpoint:
+    health:
+      probes:
+        # Already the default since Boot 4.0 (in 3.x they auto-enabled only on DETECTED
+        # Kubernetes/Cloud Foundry). Explicit, because auto-detection may not trip on every
+        # platform.
+        enabled: true
+
+        # Also serves /livez and /readyz on the MAIN server port. This is the fix when the platform
+        # can only probe the ingress port — Azure Container Apps exposes exactly one ingress target
+        # port per container, probes it over HTTP(S) or TCP only (exec probes are NOT supported),
+        # and allows one probe of each type. A separate management.server.port makes every probe
+        # 404.
+        add-additional-paths: true
+
+      # `always` leaks downstream hostnames, DB product/version and stack traces on an
+      # internet-facing ingress. People set it to debug and leave it.
+      show-details: never
+      show-components: never
+
+      # Default true, and your friend: a typo'd indicator id in a group FAILS STARTUP instead of
+      # silently giving you a readiness group that checks nothing. Do not set it false to "fix" a
+      # startup error.
+      validate-group-membership: true
+
+      group:
+        # LIVENESS = IN-PROCESS STATE ONLY. Never `db`. The docs: a liveness probe "should not
+        # depend on health checks for external systems", because a liveness failure means RESTART —
+        # which cannot fix Postgres and instead discards the warm Hikari pool and any in-flight
+        # work, amplifying the incident into a fleet-wide restart storm.
+        liveness:
+          include: "livenessState"
+
+        # READINESS = "can I serve a useful request?". Failing here only removes this replica from
+        # the load balancer, which is recoverable and reversible.
+        #
+        # Include a dependency ONLY if the service can serve NO useful request without it. The
+        # database qualifies. A notification service, a cache, or a non-critical upstream adapter
+        # does not — degrade those in the response, not in the probe.
+        #
+        # In particular do NOT add Resilience4j's `circuitBreakers` indicator here: an OPEN breaker
+        # on one flaky non-critical downstream would drain EVERY replica at once, and new replicas
+        # would fail readiness too, so the autoscaler cannot help.
+        readiness:
+          include: "readinessState,db"
+
+  metrics:
+    tags:
+      application: ${spring.application.name}
+
+  observations:
+    annotations:
+      # Defaults to FALSE. Without this AND spring-boot-starter-aspectj on the classpath,
+      # @Timed / @Counted / @Observed / @MeterTag compile, run, and produce NOTHING.
+      #
+      # NOTE the starter is spring-boot-starter-aspectj in Boot 4 — spring-boot-starter-aop is a
+      # 404 at 4.1.0, so a half-done upgrade silently disables every annotation-driven metric.
+      # Verify a new metric actually appears on /actuator/prometheus before building a dashboard.
+      enabled: true
+
+  tracing:
+    sampling:
+      # The DEFAULT IS 0.1, so 90% of traces are never exported. MDC population and correlated log
+      # lines still work at any sampling rate, which is why people conclude "tracing is broken"
+      # while their logs look fine. Set it per environment; 1.0 is right for a low-volume money
+      # service where every trace matters.
+      probability: 1.0
+    baggage:
+      # Propagate the business key over the wire and into MDC. Prefer this over a bespoke MDC
+      # filter, which leaks ids across pooled request threads if it does not clear in a finally
+      # block — catastrophic for auditing a money service.
+      remote-fields: "idempotencyKey"
+      correlation:
+        fields: "idempotencyKey"
+    # NOTE: `management.tracing.enabled` was renamed to `management.tracing.export.enabled` in
+    # Boot 4. The old key is silently ignored.
+
+logging:
+  level:
+    root: INFO
+    com.example.ledger: INFO
+    # Uncomment to see every statement and its bound parameters. NEVER in production: bound
+    # parameters include account identifiers and amounts.
+    # org.springframework.jdbc.core.JdbcTemplate: DEBUG
+    # org.springframework.jdbc.core.StatementCreatorUtils: TRACE
+
+# =====================================================================================
+# --- application-prod.yaml (separate file) ------------------------------------------
+# =====================================================================================
+# logging:
+#   structured:
+#     # Built into Boot since 3.4: ECS/GELF/Logstash JSON for Logback and Log4j2, property-driven.
+#     # Deletes logback-spring.xml AND the net.logstash.logback dependency, and MDC (so traceId and
+#     # spanId) lands as real queryable fields rather than a bracketed prefix you have to regex
+#     # back apart.
+#     #
+#     # Set this ONLY in deployed profiles. In application-local.yaml leave it UNSET: it turns off
+#     # the human-readable console pattern, which makes local development miserable and pushes
+#     # people to disable structured logging entirely.
+#     format:
+#       console: ecs
+#     ecs:
+#       service:
+#         name: ${spring.application.name}
+#         environment: ${APP_ENV:prod}
+#     json:
+#       stacktrace:
+#         root: last
+#         max-length: 4096
+#         include-common-frames: false
+#
+# And in the platform manifest, allow MORE time than Spring will use:
+#
+#   # Kubernetes
+#   terminationGracePeriodSeconds: 45      # 10s drain + 24s Spring + slack
+#   lifecycle:
+#     preStop:
+#       exec:
+#         command: ["sh", "-c", "sleep 10"]    # distroless: ["/bin/sleep", "10"]
+#   startupProbe:  { httpGet: { path: /livez,  port: 8080 }, periodSeconds: 3,  failureThreshold: 40 }
+#   livenessProbe: { httpGet: { path: /livez,  port: 8080 }, periodSeconds: 10, failureThreshold: 3 }
+#   readinessProbe:{ httpGet: { path: /readyz, port: 8080 }, periodSeconds: 2,  failureThreshold: 2 }
+#
+# WHY the preStop sleep is a FIX and not a hack: Kubernetes sends SIGTERM and removes the Pod from
+# Service endpoints CONCURRENTLY. Endpoint removal must propagate through kube-proxy/iptables or the
+# ingress controller on every node, which takes hundreds of ms to seconds — during which the app has
+# already stopped accepting connections. Anything routed in that window gets a connection refused,
+# i.e. a burst of 502s on EVERY rollout, usually blamed on "the network". preStop delays only
+# SIGTERM; the container keeps serving throughout. Size it >= readinessProbe.periodSeconds x
+# failureThreshold plus your ingress' propagation.
+#
+# WHY a startupProbe: during startup Boot reports liveness BROKEN until the context has refreshed. A
+# cold JVM plus Flyway migrations against a busy Postgres can exceed a default liveness threshold —
+# at which point the orchestrator restarts the container MID-MIGRATION, tries again, is killed
+# again: CrashLoopBackOff caused purely by probe config, and a partially applied schema.
+#
+# Azure Container Apps has no preStop hook and no exec probes, so you rely on readiness turning 503
+# — which is an argument for a SHORTER readiness period there. Its probe block goes at
+# properties.template.containers[].probes with types Startup/Liveness/Readiness, and the grace
+# period at properties.template.terminationGracePeriodSeconds.
+#
+# =====================================================================================
+# --- application-local.yaml (separate file) -----------------------------------------
+# =====================================================================================
+# spring:
+#   datasource:
+#     url: "jdbc:postgresql://localhost:5432/ledger?ApplicationName=ledger-api-local"
+#     # For LOCAL DEV ONLY, and only because these credentials are worthless. Prefer running
+#     # TestLedgerApplication (SpringApplication.from(...).with(TestcontainersConfiguration)) so a
+#     # throwaway Postgres 18 starts itself and there is nothing to configure at all.
+#     username: ledger
+#     password: ledger
+# server:
+#   tomcat:
+#     basedir: ${java.io.tmpdir}/tomcat
+# logging:
+#   level:
+#     com.example.ledger: DEBUG
+# management:
+#   endpoint:
+#     health:
+#       show-details: always      # fine locally; never on a deployed profile
+#
+# =====================================================================================
+# NOT set here, deliberately
+# =====================================================================================
+# spring.threads.virtual.enabled
+#   Enable it only when the bottleneck is genuinely blocking-I/O concurrency, and re-derive every
+#   pool size when you do. Boot's docs are explicit that thread-pool properties then have NO
+#   effect: spring.task.execution.pool.*, spring.task.scheduling.pool.size and
+#   server.tomcat.threads.max all become inert. The safety property those pools quietly provided
+#   was ADMISSION CONTROL — 200 platform threads meant at most 200 concurrent DB calls. With
+#   unbounded virtual threads, 10,000 concurrent requests all queue on a 10-connection Hikari pool
+#   and you convert a throughput problem into a timeout cascade. Requires Java 21+; Java 24+ is
+#   strongly recommended (JEP 491 stopped `synchronized` from pinning carrier threads).
+#
+# spring.datasource.hikari.transaction-isolation
+#   Never set isolation globally. You would inherit SQLSTATE 40001 on ordinary traffic — including
+#   on INSERT ... ON CONFLICT DO NOTHING — with no retry anywhere. Set it per transaction with
+#   @Transactional(isolation = ...) where a specific statement actually needs it.
+#
+# spring.jackson.use-jackson2-defaults
+#   A Boot 4.0 migration shim with a short fuse. Jackson 3 is the default and it flipped two
+#   client-visible defaults (alphabetical property order is now ON, dates now emit ISO-8601 strings
+#   rather than epoch numbers). Fix your contract and your assertions rather than pinning the old
+#   behaviour; 4.1 already removed everything deprecated in 4.0.
