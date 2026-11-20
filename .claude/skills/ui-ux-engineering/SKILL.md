@@ -21,7 +21,7 @@ Need a form input?   → import { Input } from "@/components/ui/input"
 Need a select?       → import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 Need a table?        → import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 Need tabs?           → import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
-Need a toast?        → import { useToast } from "@/hooks/use-toast" OR sonner
+Need a toast?        → import { toast } from "sonner"  (mount <Toaster /> once in the root layout; Shadcn's old useToast is deprecated)
 Need a card?         → import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "@/components/ui/card"
 Need a badge?        → import { Badge } from "@/components/ui/badge"
 Need a skeleton?     → import { Skeleton } from "@/components/ui/skeleton"
@@ -89,7 +89,7 @@ Key responsive patterns with Shadcn:
 Every action must produce visible feedback within 100ms:
 
 - **Button clicks** — Use `<Button disabled={isPending}>` with loading content: `{isPending ? (<><Loader2 className="h-4 w-4 animate-spin" /> Saving...</>) : "Save Changes"}`.
-- **Form submissions** — Button loading state → `toast({ title: "Success", description: "Course saved" })` or `toast({ variant: "destructive", title: "Error", description: "..." })`.
+- **Form submissions** — Button loading state → `toast.success("Course saved")` or `toast.error("Couldn't save course", { description: "..." })`. For one request, `toast.promise(...)` shows loading, success and error in a single toast.
 - **Destructive actions** — Always use `<AlertDialog>` with clear language. Use `<Button variant="destructive">` for confirm.
 - **Navigation** — Use `usePathname()` to highlight active `<SidebarMenuButton>`. Show loading bar for page transitions.
 - **Async mutations** — Optimistic UI where possible. Otherwise `<Loader2 className="h-4 w-4 animate-spin" />` near the affected area.
@@ -117,7 +117,7 @@ Shadcn/UI handles most accessibility via Radix UI primitives. But you still must
 
 Micro-details with Tailwind + Shadcn:
 
-- **Transitions** — `transition-all duration-200` on every interactive element. Cards: `transition-all duration-200 hover:shadow-md hover:-translate-y-0.5`. Buttons: Shadcn handles this by default.
+- **Transitions** — `transition-all duration-200` on every interactive element. Clickable cards only (cards that link or open something): `transition-all duration-200 hover:shadow-md hover:-translate-y-0.5`. Static info cards don't move on hover; motion there suggests a click that does nothing. Buttons: Shadcn handles this by default.
 - **Consistent spacing** — Tailwind scale only: `gap-1.5`, `gap-2`, `gap-3`, `gap-4`, `gap-6`, `gap-8`. NEVER `gap-[13px]` or arbitrary values.
 - **Consistent radius** — `rounded-lg` for Card/containers, `rounded-md` for Button/Input (Shadcn default), `rounded-full` for Avatar/Badge.
 - **Icon sizing** — Lucide icons: `h-4 w-4` with body text, `h-5 w-5` with headings, `h-3.5 w-3.5` in Badge. Always `flex items-center gap-2` for icon + text.
@@ -203,7 +203,7 @@ ALWAYS build: `<Skeleton>` while loading, Lucide icon + message when empty, `<Al
 Mobile-first: no prefix (mobile) → `sm:` → `md:` → `lg:`. Use `<Sheet>` instead of `<Dialog>` on mobile. Card layout instead of `<Table>` on mobile.
 
 ### 3. Missing feedback on actions
-ALWAYS: `<Button disabled={isPending}>` + `<Loader2>` spinner + `toast()` on success/failure.
+ALWAYS: `<Button disabled={isPending}>` + `<Loader2>` spinner + `toast.success()` / `toast.error()` (sonner) on success/failure.
 
 ### 4. Hardcoding colors
 Using `bg-white`, `text-black`, `bg-gray-100` breaks dark mode. ALWAYS use `bg-background`, `text-foreground`, `bg-muted`, `text-muted-foreground`, `bg-card`, `border`.
